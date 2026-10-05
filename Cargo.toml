@@ -1,0 +1,16 @@
+[package]
+name = "pek-radmin"
+version = "0.1.0"
+edition = "2024"
+description = "Pek 管理组件（Rust）：管理系统的用户/权限/操作审计通用数据层（应用组装件，基于 Pek.RCode）"
+authors = ["PeiKeSmart"]
+license = "MIT"
+
+[dependencies]
+# DH 基础库（日志 / 随机 / 签名）
+dhrust = { path = "../DH.RustBase" }
+# 数据访问（XCode 模型 / SQLite；仅核心，无驱动分发）
+pek-rcode = { path = "../Pek.RCode", default-features = false }
+# 审计时间与 JSON 视图
+chrono = "0.4"
+serde_json = "1"
