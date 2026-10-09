@@ -48,7 +48,7 @@ use chrono::{Local, NaiveDateTime};
 use serde_json::{json, Value as Json};
 
 use pek_rcode::store::SharedStore;
-use pek_rcode::{DbRow, DbValue, Query, Where};
+use pek_rcode::{Dal, DbRow, DbValue, Query, SqlSession, Where};
 
 /// 用户表（实体名，见各应用 `Entity/Model.xml`）。
 pub const TABLE_USER: &str = "PanelUser";
@@ -421,6 +421,65 @@ pub fn record(store: &SharedStore, entry: &AuditEntry) {
     }
 }
 
+// ————— 清理 —————
+
+/// 单次清理上限（防御；每日调用场景足够）。
+const MAX_CLEANUP_ROWS: usize = 10_000;
+
+/// 清理过期操作日志（`LogTime` 早于“当前时间 - days 天”的记录逐条删除；`days = 0` 不清理）。
+/// 返回删除条数；实体名/时间列与 [`record`] 写入一致（消费方无需硬编码物理表）。
+pub fn cleanup_logs(store: &SharedStore, days: u32) -> Result<usize, String> {
+    store.with_session(|dal, session| cleanup_logs_dal(dal, session, days))
+}
+
+/// Dal 级清理（首开闭包内等无共享存储上下文的场景，如打开时清理）。
+pub fn cleanup_logs_dal(
+    dal: &Dal,
+    session: &mut dyn SqlSession,
+    days: u32,
+) -> pek_rcode::Result<usize> {
+    if days == 0 {
+        return Ok(0);
+    }
+    let cutoff = Local::now().naive_local() - chrono::Duration::days(i64::from(days));
+    let table = dal.table(TABLE_OPLOG)?;
+    let rows = table.query(
+        session,
+        &Query::new()
+            .column("Id")
+            .filter(Where::new().lt("LogTime", cutoff))
+            .take(MAX_CLEANUP_ROWS),
+    )?;
+    let mut removed = 0usize;
+    for row in rows.rows.iter() {
+        let id = row.get_by_name("Id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if id <= 0 {
+            continue;
+        }
+        if table.delete_by_pk(session, &[id.into()])? > 0 {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+// ————— 用户变更守卫 —————
+
+/// 用户变更防呆（通用守卫）：模拟应用变更后的用户列表必须至少保留一个超级管理员
+/// （`is_super` 由调用方界定，如“启用且拥有全部权限”）；不满足时返回 `Err(message)`，
+/// 调用方一般直接回 400。收编自平台 `user_update`/`user_delete` 的防锁死校验。
+pub fn ensure_super_remains<T>(
+    users_after: &[T],
+    is_super: impl Fn(&T) -> bool,
+    message: &str,
+) -> Result<(), String> {
+    if users_after.iter().any(|u| is_super(u)) {
+        Ok(())
+    } else {
+        Err(message.to_string())
+    }
+}
+
 /// 分页查询操作日志（按时间倒序）。
 ///
 /// - `category`：按类别过滤（`panel`/`api`；空 = 全部；内存过滤——兼容无 `Category` 列的表）；
@@ -760,6 +819,65 @@ mod tests {
     fn cleanup(base: &Path) {
         pek_rcode::store::drop_for_test(base);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn cleanup_logs_removes_expired_only() {
+        let base = temp_base("cleanup");
+        let store = open_store(&base, MODEL_WITHOUT_CATEGORY);
+        record(
+            &store,
+            &AuditEntry {
+                user: "old".into(),
+                action: "a".into(),
+                ..Default::default()
+            },
+        );
+        record(
+            &store,
+            &AuditEntry {
+                user: "new".into(),
+                action: "a".into(),
+                ..Default::default()
+            },
+        );
+        // 把较早一条改成 40 天前
+        let old = Local::now().naive_local() - chrono::Duration::days(40);
+        store
+            .with_session(|dal, session| {
+                let table = dal.table(TABLE_OPLOG)?;
+                let rows = table.query(
+                    session,
+                    &Query::new()
+                        .filter(Where::new().eq("UserName", "old"))
+                        .take(1),
+                )?;
+                let id = rows
+                    .rows
+                    .first()
+                    .and_then(|r| r.get_by_name("Id"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                table.update_by_pk(session, &[("LogTime", old.into())], &[id.into()])?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(cleanup_logs(&store, 30).unwrap(), 1, "仅清理过期记录");
+        assert_eq!(
+            query_logs(&store, 1, 10, "", "", "", None).unwrap()["total"],
+            1,
+            "未过期记录应保留"
+        );
+        assert_eq!(cleanup_logs(&store, 0).unwrap(), 0, "0 = 不清理");
+        cleanup(&base);
+    }
+
+    #[test]
+    fn ensure_super_remains_guard_works() {
+        assert!(ensure_super_remains(&[1, 2], |v| *v == 2, "需要保留").is_ok());
+        assert!(ensure_super_remains(&[1, 3], |v| *v == 2, "需要保留").is_err());
+        assert!(ensure_super_remains::<i32>(&[], |_| true, "需要保留").is_err());
     }
 
     #[test]
