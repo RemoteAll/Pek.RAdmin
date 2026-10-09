@@ -617,13 +617,9 @@ pub fn is_sensitive_key(key: &str) -> bool {
     k.contains("password") || k.contains("secret") || k.contains("token") || k.contains("apikey")
 }
 
-/// 按字符截断（附省略号；不破坏 UTF-8 边界）。
+/// 按字符截断（附省略号；不破坏 UTF-8 边界）——实现已下沉 `dhrust::text::truncate_chars`。
 pub fn truncate_text(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max).collect();
-    format!("{clipped}…")
+    dhrust::text::truncate_chars(text, max)
 }
 
 #[cfg(test)]
