@@ -443,24 +443,17 @@ pub fn cleanup_logs_dal(
     }
     let cutoff = Local::now().naive_local() - chrono::Duration::days(i64::from(days));
     let table = dal.table(TABLE_OPLOG)?;
-    let rows = table.query(
+    // 一条 `DELETE ... WHERE LogTime < ?` 完成清理。
+    // 原来是「先查 Id、再逐条 delete_by_pk」——清理 1 万条要 1 万次往返（每日任务，纯浪费）。
+    // `delete_where_batched` 对方言不支持批量时自动回退逐条，语义一致。
+    let removed = table.delete_where_batched(
         session,
-        &Query::new()
-            .column("Id")
-            .filter(Where::new().lt("LogTime", cutoff))
-            .take(MAX_CLEANUP_ROWS),
+        &Where::new().lt("LogTime", cutoff),
+        Some(MAX_CLEANUP_ROWS),
+        None,
+        None,
     )?;
-    let mut removed = 0usize;
-    for row in rows.rows.iter() {
-        let id = row.get_by_name("Id").and_then(|v| v.as_i64()).unwrap_or(0);
-        if id <= 0 {
-            continue;
-        }
-        if table.delete_by_pk(session, &[id.into()])? > 0 {
-            removed += 1;
-        }
-    }
-    Ok(removed)
+    Ok(removed as usize)
 }
 
 // ————— 用户变更守卫 —————
@@ -473,7 +466,7 @@ pub fn ensure_super_remains<T>(
     is_super: impl Fn(&T) -> bool,
     message: &str,
 ) -> Result<(), String> {
-    if users_after.iter().any(|u| is_super(u)) {
+    if users_after.iter().any(is_super) {
         Ok(())
     } else {
         Err(message.to_string())
@@ -590,24 +583,16 @@ pub fn query_logs(
     })
 }
 
-// ————— 审计展示工具（纯函数，供应用层组装摘要/标题） —————
+// ————— 审计展示工具（实现已下沉 `dhrust::audit`；此处保留同名导出以兼容既有调用方） —————
 
 /// 路径最后一段（动作名，如 `/panel/userSave` → `userSave`）。
 pub fn action_name_of(path: &str) -> String {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
+    dhrust::audit::action_name_of(path)
 }
 
-/// 动作中文名（`titles` 为应用的动作→中文名映射；未知动作回退为 `操作 {action}`）。
+/// 动作中文名（`titles` 为「动作 → 中文名」映射；未知动作回退为 `操作 {action}`）。
 pub fn action_title(action: &str, titles: &[(&str, &str)]) -> String {
-    titles
-        .iter()
-        .find(|(name, _)| *name == action)
-        .map(|(_, title)| (*title).to_string())
-        .unwrap_or_else(|| format!("操作 {action}"))
+    dhrust::audit::action_title(action, titles)
 }
 
 /// 请求参数摘要：查询串 + JSON/表单体（敏感字段脱敏；截断至 400 字符）。
@@ -615,65 +600,22 @@ pub fn action_title(action: &str, titles: &[(&str, &str)]) -> String {
 /// `content_type` 传请求头值（小写匹配 `application/json` / `x-www-form-urlencoded`）；
 /// 其他类型只记 `body={n} 字节`（不落二进制内容）。
 pub fn summarize_body(query: &str, content_type: &str, body: &[u8]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if !query.is_empty() {
-        parts.push(redact_form(query));
-    }
-    if !body.is_empty() {
-        let content_type = content_type.to_ascii_lowercase();
-        if content_type.contains("application/json") && body.len() <= 64 * 1024 {
-            match serde_json::from_slice::<Json>(body) {
-                Ok(mut v) => {
-                    redact_json(&mut v);
-                    parts.push(v.to_string());
-                }
-                Err(_) => parts.push(format!("body={} 字节", body.len())),
-            }
-        } else if content_type.contains("x-www-form-urlencoded") {
-            parts.push(redact_form(&String::from_utf8_lossy(body)));
-        } else {
-            parts.push(format!("body={} 字节", body.len()));
-        }
-    }
-    truncate_text(&parts.join(" | "), 400)
+    dhrust::audit::summarize_body(query, content_type, body)
 }
 
-/// `k=v&k2=v2` 形式摘要素材的脱敏。
+/// `k=v&k2=v2` 形式串的脱敏。
 pub fn redact_form(text: &str) -> String {
-    text.split('&')
-        .map(|pair| match pair.split_once('=') {
-            Some((k, _)) if is_sensitive_key(k) => format!("{k}=***"),
-            _ => pair.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("&")
+    dhrust::audit::redact_form(text)
 }
 
 /// JSON 体递归脱敏（键名含 password/secret/token/apikey 的值替换为 `***`）。
 pub fn redact_json(v: &mut Json) {
-    match v {
-        Json::Object(map) => {
-            for (k, val) in map.iter_mut() {
-                if is_sensitive_key(k) {
-                    *val = json!("***");
-                } else {
-                    redact_json(val);
-                }
-            }
-        }
-        Json::Array(items) => {
-            for item in items {
-                redact_json(item);
-            }
-        }
-        _ => {}
-    }
+    dhrust::audit::redact_json(v)
 }
 
 /// 是否敏感键（不区分大小写包含匹配；`apikey` 覆盖 AI 接口密钥等）。
 pub fn is_sensitive_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    k.contains("password") || k.contains("secret") || k.contains("token") || k.contains("apikey")
+    dhrust::audit::is_sensitive_key(key)
 }
 
 /// 按字符截断（附省略号；不破坏 UTF-8 边界）——实现已下沉 `dhrust::text::truncate_chars`。
