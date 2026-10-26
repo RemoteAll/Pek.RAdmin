@@ -234,6 +234,108 @@ impl PanelAuth {
         }
     }
 
+    /// 列出全部用户（内部结构，含密码哈希；供「平台统一下发」等需要摘要/比对的服务端场景）。
+    pub fn list_users(&self, store: &SharedStore) -> Result<Vec<PanelUser>, String> {
+        self.list_raw(store)
+    }
+
+    /// 用户清单摘要（排序后 SHA-256）：平台据此判断「节点用户是否与平台一致」，
+    /// 无需每次拉全量清单（心跳只带摘要，差异时再同步）。
+    pub fn users_digest(&self, store: &SharedStore) -> Result<String, String> {
+        let mut lines: Vec<String> = self
+            .list_raw(store)?
+            .into_iter()
+            .map(|u| {
+                let perms = {
+                    let mut p = u.permissions.clone();
+                    p.sort();
+                    p.join(",")
+                };
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    u.user_name.to_ascii_lowercase(),
+                    u.enabled as u8,
+                    perms,
+                    u.remark.trim(),
+                    u.password_hash
+                )
+            })
+            .collect();
+        lines.sort();
+        Ok(dhrust::sign::sha256_hex(lines.join("\n").as_bytes()))
+    }
+
+    /// 保存用户（**直接写入密码哈希/盐**；平台统一下发场景不接触明文）。
+    ///
+    /// - 已存在：`password_hash` 为空表示不改密码；非空则同时更新 `Salt` + `PasswordHash`；
+    /// - 不存在：`password_hash` 必须非空；
+    /// - 哈希与盐由调用方按双方约定口径计算（`SHA-256(salt:password)`，见
+    ///   [`dhrust::sign::salted_sha256_hex`]）；本方法只做格式护栏。
+    pub fn save_user_hashed(
+        &self,
+        store: &SharedStore,
+        user_name: &str,
+        password_hash: &str,
+        salt: &str,
+        permissions: &[String],
+        enabled: bool,
+        remark: &str,
+    ) -> Result<(), String> {
+        let name = user_name.trim();
+        if name.is_empty() || name.len() > 50 {
+            return Err("用户名不能为空且不超过 50 字符".to_string());
+        }
+        if name.contains(',') || name.contains(char::is_whitespace) {
+            return Err("用户名不能包含逗号或空白字符".to_string());
+        }
+        let hash = password_hash.trim();
+        let salt = salt.trim();
+        if !hash.is_empty() && !valid_secret_text(hash) {
+            return Err("密码哈希格式不合法".to_string());
+        }
+        if !salt.is_empty() && !valid_secret_text(salt) {
+            return Err("密码盐格式不合法".to_string());
+        }
+        let perms = self.normalize(permissions);
+
+        match self.find_user(store, name)? {
+            Some(user) => store.with_session(|dal, session| {
+                let table = dal.table(TABLE_USER)?;
+                let mut fields: Vec<(&str, DbValue)> = vec![
+                    ("Permissions", perms.join(",").into()),
+                    ("Enabled", enabled.into()),
+                    ("Remark", remark.trim().into()),
+                ];
+                if !hash.is_empty() {
+                    fields.push(("Salt", salt.into()));
+                    fields.push(("PasswordHash", hash.into()));
+                }
+                table.update_by_pk(session, &fields, &[user.id.into()])?;
+                Ok(())
+            }),
+            None => {
+                if hash.is_empty() {
+                    return Err("新用户必须设置密码".to_string());
+                }
+                store.with_session(|dal, session| {
+                    let table = dal.table(TABLE_USER)?;
+                    table.insert(
+                        session,
+                        &[
+                            ("UserName", name.into()),
+                            ("PasswordHash", hash.into()),
+                            ("Salt", salt.into()),
+                            ("Permissions", perms.join(",").as_str().into()),
+                            ("Enabled", enabled.into()),
+                            ("Remark", remark.trim().into()),
+                        ],
+                    )?;
+                    Ok(())
+                })
+            }
+        }
+    }
+
     /// 修改用户密码（校验旧密码；供用户自助改密）。
     pub fn change_user_password(
         &self,
@@ -290,6 +392,15 @@ fn new_salt() -> String {
 /// 计算密码哈希：`SHA-256(salt:password)` hex（口径统一在 `dhrust::sign::salted_sha256_hex`）。
 fn hash_password(salt: &str, password: &str) -> String {
     dhrust::sign::salted_sha256_hex(salt, password)
+}
+
+/// 外部下发的哈希/盐格式护栏：可见 ASCII、无空白（hex / `$算法$…` 两种形态都放行）。
+fn valid_secret_text(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= 128
+        && text
+            .chars()
+            .all(|c| c.is_ascii_graphic() && c != ',' && c != '|')
 }
 
 // ————— 用户结构 —————
@@ -761,6 +872,51 @@ mod tests {
     fn cleanup(base: &Path) {
         pek_rcode::store::drop_for_test(base);
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn save_user_hashed_and_digest() {
+        let base = temp_base("hashed");
+        let store = open_store(&base, MODEL_WITHOUT_CATEGORY);
+        let auth = PanelAuth::new(PERMS);
+        let salt = "0011223344556677";
+        let hash = dhrust::sign::salted_sha256_hex(salt, "pw123");
+
+        // 新增：直接写哈希，可用原密码登录
+        auth.save_user_hashed(
+            &store,
+            "Alice",
+            &hash,
+            salt,
+            &["settings".to_string(), "records".to_string()],
+            true,
+            "平台下发",
+        )
+        .unwrap();
+        let user = auth.verify_login(&store, "alice", "pw123").unwrap().unwrap();
+        assert_eq!(user.permissions, vec!["records", "settings"]);
+        assert_eq!(user.remark, "平台下发");
+        let digest1 = auth.users_digest(&store).unwrap();
+
+        // 更新：哈希留空 = 不改密码；权限/启用变化 → 摘要变化
+        auth.save_user_hashed(&store, "alice", "", "", &["records".to_string()], false, "")
+            .unwrap();
+        assert!(auth.verify_login(&store, "alice", "pw123").unwrap().is_none(), "禁用后不能登录");
+        let digest2 = auth.users_digest(&store).unwrap();
+        assert_ne!(digest1, digest2, "权限/启用变化应改变摘要");
+
+        // 摘要稳定（同一状态多次计算结果一致）
+        assert_eq!(digest2, auth.users_digest(&store).unwrap());
+
+        // 新用户必须带哈希；非法哈希被拒
+        assert!(auth
+            .save_user_hashed(&store, "bob", "", "", &["records".to_string()], true, "")
+            .is_err());
+        assert!(auth
+            .save_user_hashed(&store, "bob", "bad hash\n", "s", &[], true, "")
+            .is_err());
+
+        cleanup(&base);
     }
 
     #[test]
