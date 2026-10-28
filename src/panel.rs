@@ -63,6 +63,9 @@ pub const TABLE_OPLOG: &str = "OperationLog";
 #[derive(Clone, Debug)]
 pub struct PanelAuth {
     perms: Vec<(String, String)>,
+    /// 动态权限前缀（如 `db:`）：不在静态表内、由业务对象生成的权限键，
+    /// 保存时**保留**而不当“未知项”丢弃。
+    prefixes: Vec<String>,
 }
 
 impl PanelAuth {
@@ -73,7 +76,20 @@ impl PanelAuth {
                 .iter()
                 .map(|(k, n)| (k.to_string(), n.to_string()))
                 .collect(),
+            prefixes: Vec::new(),
         }
+    }
+
+    /// 允许某类前缀的**动态权限键**（如 `db:` 下的 `db:read:订单库`）在保存时被保留。
+    ///
+    /// 这些键不出现在 `all_permissions_json()` 里（由业务页自己渲染勾选项），
+    /// 但会原样落库、随登录写进用户令牌。
+    pub fn allow_prefix(mut self, prefix: impl Into<String>) -> Self {
+        let prefix = prefix.into();
+        if !prefix.is_empty() && !self.prefixes.contains(&prefix) {
+            self.prefixes.push(prefix);
+        }
+        self
     }
 
     /// 全部权限定义（面板「用户」页渲染用）：`[{key,name}]`。
@@ -93,13 +109,24 @@ impl PanelAuth {
             .unwrap_or_else(|| key.to_string())
     }
 
-    /// 规范化权限列表（去重、去空白、过滤未知项，保持定义顺序）。
+    /// 规范化权限列表（去重、去空白、保留静态项与动态前缀项，静态项按定义顺序）。
     pub fn normalize(&self, list: &[String]) -> Vec<String> {
-        self.perms
+        let mut kept: Vec<String> = self
+            .perms
             .iter()
             .map(|(k, _)| k.clone())
             .filter(|k| list.iter().any(|p| p.trim() == k))
-            .collect()
+            .collect();
+        for raw in list {
+            let key = raw.trim();
+            if key.is_empty() || kept.iter().any(|k| k == key) {
+                continue;
+            }
+            if self.prefixes.iter().any(|p| key.starts_with(p.as_str())) {
+                kept.push(key.to_string());
+            }
+        }
+        kept
     }
 
     /// 列出全部用户（JSON 视图，含权限中文名）+ 可选权限定义。
@@ -1155,6 +1182,35 @@ mod tests {
         assert_eq!(auth.permission_name("database"), "数据库管理");
         assert_eq!(auth.permission_name("missing"), "missing");
         assert_eq!(auth.all_permissions_json().len(), 3);
+    }
+
+    #[test]
+    fn allow_prefix_keeps_dynamic_permissions() {
+        // 业务侧“按对象生成”的权限键（如数据源级 db:read:订单库）必须落库，
+        // 否则面板勾了也白勾；但其它未知键仍按原样丢弃（防拼错生效）。
+        let auth = PanelAuth::new(PERMS).allow_prefix("db:");
+        let list: Vec<String> = vec![
+            "db:read:orders".into(),
+            "settings".into(),
+            " db:write:orders ".into(),
+            "db:*".into(),
+            "db:read:orders".into(),
+            "unknown:read:x".into(),
+            "records".into(),
+        ];
+        assert_eq!(
+            auth.normalize(&list),
+            vec![
+                "records",
+                "settings",
+                "db:read:orders",
+                "db:write:orders",
+                "db:*"
+            ]
+        );
+        // 动态键不在静态表里，但保存后能原样读出（未知键回退 key 本身）
+        assert_eq!(auth.all_permissions_json().len(), 3);
+        assert_eq!(auth.permission_name("db:read:orders"), "db:read:orders");
     }
 
     #[test]
