@@ -671,7 +671,17 @@ pub fn query_logs(
             let time = row
                 .get_by_name("LogTime")
                 .and_then(|v| v.as_datetime())
-                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .map(|t| {
+                    // 毫秒能显示就显示：SQLite 的 datetime 文本带小数、MySQL `DATETIME(3)` 也有；
+                    // 老库若还是 `DATETIME`（0 位小数）则只有整秒 —— 此时保持原格式，不硬凑 `.000`。
+                    // 要 MySQL 真存毫秒：`ALTER TABLE <表> MODIFY LogTime DATETIME(3);`
+                    use chrono::Timelike as _;
+                    if t.nanosecond() >= 1_000_000 {
+                        t.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                    } else {
+                        t.format("%Y-%m-%d %H:%M:%S").to_string()
+                    }
+                })
                 .unwrap_or_default();
             let row_category = text("Category");
             let action = text("Action");
